@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readConfigFileSnapshot } from "../../config/config.js";
 import { redactConfigObject } from "../../config/redact-snapshot.js";
 import {
@@ -7,46 +8,105 @@ import {
 } from "../../config/talk.js";
 import type { TalkConfigResponse, TalkProviderConfig } from "../../config/types.gateway.js";
 import type { OpenClawConfig, TtsConfig, TtsProviderConfigMap } from "../../config/types.js";
+import { listRealtimeTranscriptionProviders } from "../../realtime-transcription/provider-registry.js";
+import type { RealtimeTranscriptionProviderConfig } from "../../realtime-transcription/provider-types.js";
 import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL,
   REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
+  buildRealtimeVoiceAgentConsultChatMessage,
 } from "../../realtime-voice/agent-consult-tool.js";
-import { getRealtimeVoiceProvider } from "../../realtime-voice/provider-registry.js";
+import {
+  canonicalizeRealtimeVoiceProviderId,
+  listRealtimeVoiceProviders,
+} from "../../realtime-voice/provider-registry.js";
 import { resolveConfiguredRealtimeVoiceProvider } from "../../realtime-voice/provider-resolver.js";
 import type {
   RealtimeVoiceBrowserSession,
   RealtimeVoiceProviderConfig,
 } from "../../realtime-voice/provider-types.js";
+import type {
+  TalkBrain,
+  TalkEvent,
+  TalkMode,
+  TalkTransport,
+} from "../../realtime-voice/talk-events.js";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "../../shared/string-coerce.js";
-import { canonicalizeSpeechProviderId, getSpeechProvider } from "../../tts/provider-registry.js";
-import { synthesizeSpeech, type TtsDirectiveOverrides } from "../../tts/tts.js";
+import {
+  canonicalizeSpeechProviderId,
+  getSpeechProvider,
+  listSpeechProviders,
+} from "../../tts/provider-registry.js";
+import {
+  getResolvedSpeechProviderConfig,
+  resolveTtsConfig,
+  synthesizeSpeech,
+  type TtsDirectiveOverrides,
+} from "../../tts/tts.js";
 import { ADMIN_SCOPE, TALK_SECRETS_SCOPE } from "../operator-scopes.js";
 import {
   ErrorCodes,
   errorShape,
   formatValidationErrors,
+  type ErrorShape,
   type TalkSpeakParams,
+  validateTalkCatalogParams,
   validateTalkConfigParams,
+  validateTalkHandoffCreateParams,
+  validateTalkHandoffJoinParams,
+  validateTalkHandoffRevokeParams,
+  validateTalkHandoffTurnCancelParams,
+  validateTalkHandoffTurnEndParams,
+  validateTalkHandoffTurnStartParams,
   validateTalkModeParams,
   validateTalkRealtimeRelayAudioParams,
+  validateTalkRealtimeRelayCancelParams,
   validateTalkRealtimeRelayMarkParams,
   validateTalkRealtimeRelayStopParams,
   validateTalkRealtimeRelayToolResultParams,
   validateTalkRealtimeSessionParams,
+  validateTalkRealtimeToolCallParams,
+  validateTalkSessionCloseParams,
+  validateTalkSessionControlParams,
+  validateTalkSessionCreateParams,
+  validateTalkSessionInputAudioParams,
+  validateTalkSessionToolResultParams,
+  validateTalkTranscriptionRelayAudioParams,
+  validateTalkTranscriptionRelayCancelParams,
+  validateTalkTranscriptionRelayStopParams,
+  validateTalkTranscriptionSessionParams,
   validateTalkSpeakParams,
 } from "../protocol/index.js";
+import { resolveSessionKeyFromResolveParams } from "../sessions-resolve.js";
+import {
+  cancelTalkHandoffTurn,
+  createTalkHandoff,
+  endTalkHandoffTurn,
+  joinTalkHandoff,
+  revokeTalkHandoff,
+  startTalkHandoffTurn,
+  type TalkHandoffTurnResult,
+} from "../talk-handoff.js";
 import {
   acknowledgeTalkRealtimeRelayMark,
+  cancelTalkRealtimeRelayTurn,
   createTalkRealtimeRelaySession,
+  registerTalkRealtimeRelayAgentRun,
   sendTalkRealtimeRelayAudio,
   stopTalkRealtimeRelaySession,
   submitTalkRealtimeRelayToolResult,
 } from "../talk-realtime-relay.js";
+import {
+  cancelTalkTranscriptionRelayTurn,
+  createTalkTranscriptionRelaySession,
+  sendTalkTranscriptionRelayAudio,
+  stopTalkTranscriptionRelaySession,
+} from "../talk-transcription-relay.js";
 import { formatForLog } from "../ws-log.js";
+import { chatHandlers } from "./chat.js";
 import { asRecord } from "./record-shared.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
@@ -64,6 +124,111 @@ type TalkSpeakErrorDetails = {
 function canReadTalkSecrets(client: { connect?: { scopes?: string[] } } | null): boolean {
   const scopes = Array.isArray(client?.connect?.scopes) ? client.connect.scopes : [];
   return scopes.includes(ADMIN_SCOPE) || scopes.includes(TALK_SECRETS_SCOPE);
+}
+
+function canUseTalkDirectTools(client: { connect?: { scopes?: string[] } } | null): boolean {
+  const scopes = Array.isArray(client?.connect?.scopes) ? client.connect.scopes : [];
+  return scopes.includes(ADMIN_SCOPE);
+}
+
+function broadcastTalkRoomEvents(
+  context: {
+    broadcastToConnIds: (
+      event: string,
+      payload: unknown,
+      connIds: Set<string>,
+      opts?: { dropIfSlow?: boolean },
+    ) => void;
+  },
+  connId: string | undefined,
+  params: { handoffId: string; roomId: string; events: TalkEvent[] },
+): void {
+  if (!connId || params.events.length === 0) {
+    return;
+  }
+  for (const talkEvent of params.events) {
+    context.broadcastToConnIds(
+      "talk.event",
+      { handoffId: params.handoffId, roomId: params.roomId, talkEvent },
+      new Set([connId]),
+      { dropIfSlow: true },
+    );
+  }
+}
+
+type TalkHandoffFailureReason = Extract<TalkHandoffTurnResult, { ok: false }>["reason"];
+
+function talkHandoffErrorCode(reason: TalkHandoffFailureReason) {
+  return reason === "invalid_token" || reason === "no_active_turn" || reason === "stale_turn"
+    ? ErrorCodes.INVALID_REQUEST
+    : ErrorCodes.UNAVAILABLE;
+}
+
+type UnifiedTalkSessionRecord =
+  | {
+      kind: "realtime-relay";
+      connId: string;
+      relaySessionId: string;
+    }
+  | {
+      kind: "transcription-relay";
+      connId: string;
+      transcriptionSessionId: string;
+    }
+  | {
+      kind: "managed-room";
+      handoffId: string;
+      token: string;
+      roomId: string;
+    };
+
+const unifiedTalkSessions = new Map<string, UnifiedTalkSessionRecord>();
+
+function getUnifiedTalkSession(sessionId: string): UnifiedTalkSessionRecord {
+  const session = unifiedTalkSessions.get(sessionId);
+  if (!session) {
+    throw new Error("Unknown Talk session");
+  }
+  return session;
+}
+
+function requireTalkSessionConn(
+  session: Extract<UnifiedTalkSessionRecord, { connId: string }>,
+  connId: string | undefined,
+): string {
+  if (!connId || session.connId !== connId) {
+    throw new Error("Talk session is not owned by this connection");
+  }
+  return connId;
+}
+
+function normalizeTalkSessionMode(params: { mode?: string; transport?: string }): TalkMode {
+  const mode = normalizeOptionalLowercaseString(params.mode) as TalkMode | undefined;
+  if (mode) {
+    return mode;
+  }
+  return normalizeOptionalLowercaseString(params.transport) === "managed-room"
+    ? "stt-tts"
+    : "realtime";
+}
+
+function normalizeTalkSessionTransport(params: {
+  mode: TalkMode;
+  transport?: string;
+}): TalkTransport {
+  const transport = normalizeOptionalLowercaseString(params.transport) as TalkTransport | undefined;
+  if (transport) {
+    return transport;
+  }
+  return params.mode === "stt-tts" ? "managed-room" : "gateway-relay";
+}
+
+function normalizeTalkSessionBrain(params: { mode: TalkMode; brain?: string }): TalkBrain {
+  const brain = normalizeOptionalLowercaseString(params.brain) as TalkBrain | undefined;
+  if (brain) {
+    return brain;
+  }
+  return params.mode === "transcription" ? "none" : "agent-consult";
 }
 
 function asStringRecord(value: unknown): Record<string, string> | undefined {
@@ -187,24 +352,239 @@ function getVoiceCallRealtimeConfig(config: OpenClawConfig): {
   };
 }
 
+function getVoiceCallStreamingConfig(config: OpenClawConfig): {
+  provider?: string;
+  providers?: Record<string, RealtimeTranscriptionProviderConfig>;
+} {
+  const plugins = getRecord(config.plugins);
+  const entries = getRecord(plugins?.entries);
+  const voiceCall = getRecord(entries?.["voice-call"]);
+  const pluginConfig = getRecord(voiceCall?.config);
+  const streaming = getRecord(pluginConfig?.streaming);
+  const providersRaw = getRecord(streaming?.providers);
+  const providers: Record<string, RealtimeTranscriptionProviderConfig> = {};
+  if (providersRaw) {
+    for (const [providerId, providerConfig] of Object.entries(providersRaw)) {
+      const record = getRecord(providerConfig);
+      if (record) {
+        providers[providerId] = record;
+      }
+    }
+  }
+  return {
+    provider: normalizeOptionalString(streaming?.provider),
+    providers: Object.keys(providers).length > 0 ? providers : undefined,
+  };
+}
+
 function buildTalkRealtimeConfig(config: OpenClawConfig, requestedProvider?: string) {
   const voiceCallRealtime = getVoiceCallRealtimeConfig(config);
-  const talkProviderConfigs = config.talk?.providers as
+  const talkRealtime = getRecord(config.talk?.realtime);
+  const talkRealtimeProviderConfigs = talkRealtime?.providers as
     | Record<string, RealtimeVoiceProviderConfig>
     | undefined;
-  const talkProvider = normalizeOptionalString(config.talk?.provider);
-  const talkProviderSupportsRealtime = talkProvider
-    ? Boolean(getRealtimeVoiceProvider(talkProvider, config))
-    : false;
   const provider =
     normalizeOptionalString(requestedProvider) ??
-    (talkProviderSupportsRealtime ? talkProvider : undefined) ??
+    normalizeOptionalString(talkRealtime?.provider) ??
     voiceCallRealtime.provider;
   return {
     provider,
     providers: {
       ...voiceCallRealtime.providers,
-      ...talkProviderConfigs,
+      ...talkRealtimeProviderConfigs,
+    },
+    model: normalizeOptionalString(talkRealtime?.model),
+    voice: normalizeOptionalString(talkRealtime?.voice),
+    mode: normalizeOptionalLowercaseString(talkRealtime?.mode),
+    transport: normalizeOptionalLowercaseString(talkRealtime?.transport),
+    brain: normalizeOptionalLowercaseString(talkRealtime?.brain),
+  };
+}
+
+function buildTalkTranscriptionConfig(config: OpenClawConfig, requestedProvider?: string) {
+  const streamingConfig = getVoiceCallStreamingConfig(config);
+  return {
+    provider: normalizeOptionalString(requestedProvider) ?? streamingConfig.provider,
+    providers: streamingConfig.providers ?? {},
+  };
+}
+
+function resolveConfiguredRealtimeTranscriptionProvider(params: {
+  config: OpenClawConfig;
+  configuredProviderId?: string;
+  providerConfigs: Record<string, RealtimeTranscriptionProviderConfig>;
+}) {
+  const providers = listRealtimeTranscriptionProviders(params.config);
+  const normalizedConfigured = normalizeOptionalLowercaseString(params.configuredProviderId);
+  const orderedProviders = normalizedConfigured
+    ? providers.filter(
+        (provider) =>
+          normalizeOptionalLowercaseString(provider.id) === normalizedConfigured ||
+          (provider.aliases ?? []).some(
+            (alias) => normalizeOptionalLowercaseString(alias) === normalizedConfigured,
+          ),
+      )
+    : providers.toSorted((a, b) => (a.autoSelectOrder ?? 1000) - (b.autoSelectOrder ?? 1000));
+  for (const provider of orderedProviders) {
+    const rawConfig = getRealtimeTranscriptionProviderConfig({
+      providerConfigs: params.providerConfigs,
+      provider,
+      configuredProviderId: params.configuredProviderId,
+    });
+    const providerConfig = provider.resolveConfig?.({ cfg: params.config, rawConfig }) ?? rawConfig;
+    if (configuredOrFalse(() => provider.isConfigured({ cfg: params.config, providerConfig }))) {
+      return { provider, providerConfig };
+    }
+  }
+  if (normalizedConfigured) {
+    throw new Error(
+      `Realtime transcription provider "${params.configuredProviderId}" is not configured`,
+    );
+  }
+  throw new Error("No realtime transcription provider registered");
+}
+
+function getRealtimeTranscriptionProviderConfig(params: {
+  providerConfigs: Record<string, RealtimeTranscriptionProviderConfig>;
+  provider: { id: string; aliases?: readonly string[] };
+  configuredProviderId?: string;
+}): RealtimeTranscriptionProviderConfig {
+  const candidates = [
+    normalizeOptionalString(params.configuredProviderId),
+    params.provider.id,
+    ...(params.provider.aliases ?? []),
+  ].filter((key): key is string => Boolean(key));
+  const configuredKeys = Object.keys(params.providerConfigs);
+  for (const candidate of candidates) {
+    if (Object.hasOwn(params.providerConfigs, candidate)) {
+      return params.providerConfigs[candidate] ?? {};
+    }
+    const normalizedCandidate = normalizeOptionalLowercaseString(candidate);
+    const matchingKey = configuredKeys.find(
+      (key) => normalizeOptionalLowercaseString(key) === normalizedCandidate,
+    );
+    if (matchingKey) {
+      return params.providerConfigs[matchingKey] ?? {};
+    }
+  }
+  return {};
+}
+
+function configuredOrFalse(callback: () => boolean): boolean {
+  try {
+    return callback();
+  } catch {
+    return false;
+  }
+}
+
+function buildTalkCatalog(config: OpenClawConfig) {
+  const ttsConfig = resolveTtsConfig(config);
+  const talkResolved = resolveActiveTalkProviderConfig(config.talk);
+  const activeSpeechProvider = canonicalizeSpeechProviderId(talkResolved?.provider, config);
+  const streamingConfig = getVoiceCallStreamingConfig(config);
+  const realtimeConfig = buildTalkRealtimeConfig(config);
+  const activeRealtimeProvider = canonicalizeRealtimeVoiceProviderId(
+    realtimeConfig.provider,
+    config,
+  );
+
+  return {
+    modes: ["realtime", "stt-tts", "transcription"],
+    transports: ["webrtc", "provider-websocket", "gateway-relay", "managed-room"],
+    brains: ["agent-consult", "direct-tools", "none"],
+    speech: {
+      ...(activeSpeechProvider ? { activeProvider: activeSpeechProvider } : {}),
+      providers: listSpeechProviders(config).map((provider) => {
+        const entry: Record<string, unknown> = {
+          id: provider.id,
+          label: provider.label,
+          configured: configuredOrFalse(() =>
+            provider.isConfigured({
+              cfg: config,
+              providerConfig: getResolvedSpeechProviderConfig(ttsConfig, provider.id, config),
+              timeoutMs: ttsConfig.timeoutMs,
+            }),
+          ),
+          modes: ["stt-tts"],
+          brains: ["agent-consult"],
+        };
+        if (provider.models) {
+          entry.models = [...provider.models];
+        }
+        if (provider.voices) {
+          entry.voices = [...provider.voices];
+        }
+        return entry;
+      }),
+    },
+    transcription: {
+      ...(streamingConfig.provider ? { activeProvider: streamingConfig.provider } : {}),
+      providers: listRealtimeTranscriptionProviders(config).map((provider) => {
+        const rawConfig = streamingConfig.providers?.[provider.id] ?? {};
+        const providerConfig = provider.resolveConfig?.({ cfg: config, rawConfig }) ?? rawConfig;
+        const entry: Record<string, unknown> = {
+          id: provider.id,
+          label: provider.label,
+          configured: configuredOrFalse(() =>
+            provider.isConfigured({ cfg: config, providerConfig }),
+          ),
+          modes: ["transcription"],
+          transports: ["gateway-relay"],
+          brains: ["none"],
+        };
+        if (provider.defaultModel) {
+          entry.defaultModel = provider.defaultModel;
+        }
+        return entry;
+      }),
+    },
+    realtime: {
+      ...(activeRealtimeProvider ? { activeProvider: activeRealtimeProvider } : {}),
+      providers: listRealtimeVoiceProviders(config).map((provider) => {
+        const rawConfig = realtimeConfig.providers?.[provider.id] ?? {};
+        const providerConfig = provider.resolveConfig?.({ cfg: config, rawConfig }) ?? rawConfig;
+        const capabilities = provider.capabilities;
+        const entry: Record<string, unknown> = {
+          id: provider.id,
+          label: provider.label,
+          configured: configuredOrFalse(() =>
+            provider.isConfigured({ cfg: config, providerConfig }),
+          ),
+          modes: ["realtime"],
+          brains: capabilities?.supportsToolCalls === false ? ["none"] : ["agent-consult"],
+          supportsBrowserSession: Boolean(
+            capabilities?.supportsBrowserSession ?? provider.createBrowserSession,
+          ),
+        };
+        if (provider.defaultModel) {
+          entry.defaultModel = provider.defaultModel;
+        }
+        if (capabilities?.transports) {
+          entry.transports = [...capabilities.transports];
+        }
+        if (capabilities?.inputAudioFormats) {
+          entry.inputAudioFormats = capabilities.inputAudioFormats.map((format) => ({ ...format }));
+        }
+        if (capabilities?.outputAudioFormats) {
+          entry.outputAudioFormats = capabilities.outputAudioFormats.map((format) => ({
+            ...format,
+          }));
+        }
+        if (capabilities?.supportsBargeIn !== undefined) {
+          entry.supportsBargeIn = capabilities.supportsBargeIn;
+        }
+        if (capabilities?.supportsToolCalls !== undefined) {
+          entry.supportsToolCalls = capabilities.supportsToolCalls;
+        }
+        if (capabilities?.supportsVideoFrames !== undefined) {
+          entry.supportsVideoFrames = capabilities.supportsVideoFrames;
+        }
+        if (capabilities?.supportsSessionResumption !== undefined) {
+          entry.supportsSessionResumption = capabilities.supportsSessionResumption;
+        }
+        return entry;
+      }),
     },
   };
 }
@@ -231,8 +611,8 @@ function withRealtimeBrowserOverrides(
 
 function isUnsupportedBrowserWebRtcSession(session: RealtimeVoiceBrowserSession): boolean {
   const provider = normalizeLowercaseStringOrEmpty(session.provider);
-  const transport = (session as { transport?: string }).transport ?? "webrtc-sdp";
-  return provider === "google" && transport === "webrtc-sdp";
+  const transport = (session as { transport?: string }).transport ?? "webrtc";
+  return provider === "google" && transport === "webrtc";
 }
 
 function isFallbackEligibleTalkReason(reason: TalkSpeakReason): boolean {
@@ -443,7 +823,496 @@ function stripUnresolvedSecretApiKeyFromRecord(
   return rest;
 }
 
+async function startRealtimeToolCallAgentConsult(params: {
+  sessionKey: string;
+  callId: string;
+  args: unknown;
+  relaySessionId?: string;
+  connId?: string;
+  request: Parameters<GatewayRequestHandlers[string]>[0];
+}): Promise<
+  { ok: true; runId: string; idempotencyKey: string } | { ok: false; error: ErrorShape }
+> {
+  let message: string;
+  try {
+    message = buildRealtimeVoiceAgentConsultChatMessage(params.args);
+  } catch (err) {
+    return { ok: false, error: errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)) };
+  }
+  const idempotencyKey = `talk-${params.callId}-${randomUUID()}`;
+  let chatResponse: { ok: true; result: unknown } | { ok: false; error: ErrorShape } | undefined;
+  await chatHandlers["chat.send"]({
+    ...params.request,
+    req: {
+      type: "req",
+      id: `${params.request.req.id}:talk-tool-call`,
+      method: "chat.send",
+    },
+    params: {
+      sessionKey: params.sessionKey,
+      message,
+      idempotencyKey,
+    },
+    respond: (ok: boolean, result?: unknown, error?: ErrorShape) => {
+      chatResponse = ok
+        ? { ok: true, result }
+        : {
+            ok: false,
+            error: error ?? errorShape(ErrorCodes.UNAVAILABLE, "chat.send failed without error"),
+          };
+    },
+  } as never);
+
+  if (!chatResponse) {
+    return {
+      ok: false,
+      error: errorShape(ErrorCodes.UNAVAILABLE, "chat.send did not return a realtime tool result"),
+    };
+  }
+  if (!chatResponse.ok) {
+    return { ok: false, error: chatResponse.error };
+  }
+  const runId = normalizeOptionalString(asRecord(chatResponse.result)?.runId) ?? idempotencyKey;
+  if (params.relaySessionId && params.connId) {
+    registerTalkRealtimeRelayAgentRun({
+      relaySessionId: params.relaySessionId,
+      connId: params.connId,
+      sessionKey: params.sessionKey,
+      runId,
+    });
+  }
+  return { ok: true, runId, idempotencyKey };
+}
+
 export const talkHandlers: GatewayRequestHandlers = {
+  "talk.session.create": async ({ params, respond, context, client }) => {
+    if (!validateTalkSessionCreateParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.session.create params: ${formatValidationErrors(validateTalkSessionCreateParams.errors)}`,
+        ),
+      );
+      return;
+    }
+
+    const mode = normalizeTalkSessionMode(params);
+    const transport = normalizeTalkSessionTransport({ mode, transport: params.transport });
+    const brain = normalizeTalkSessionBrain({ mode, brain: params.brain });
+
+    if (transport === "webrtc" || transport === "provider-websocket") {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `talk.session.create is Gateway-managed; use talk.realtime.session for browser transport "${transport}"`,
+        ),
+      );
+      return;
+    }
+
+    try {
+      if (transport === "managed-room") {
+        if (brain === "direct-tools" && !canUseTalkDirectTools(client)) {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `talk.session.create brain="direct-tools" requires gateway scope: ${ADMIN_SCOPE}`,
+            ),
+          );
+          return;
+        }
+        const resolvedSession = await resolveSessionKeyFromResolveParams({
+          cfg: context.getRuntimeConfig(),
+          p: {
+            key: params.sessionKey,
+            includeGlobal: true,
+            includeUnknown: true,
+          },
+        });
+        if (!resolvedSession.ok) {
+          respond(false, undefined, resolvedSession.error);
+          return;
+        }
+        const handoff = createTalkHandoff({
+          sessionKey: resolvedSession.key,
+          provider: normalizeOptionalString(params.provider),
+          model: normalizeOptionalString(params.model),
+          voice: normalizeOptionalString(params.voice),
+          mode,
+          transport,
+          brain,
+          ttlMs: params.ttlMs,
+        });
+        unifiedTalkSessions.set(handoff.id, {
+          kind: "managed-room",
+          handoffId: handoff.id,
+          token: handoff.token,
+          roomId: handoff.roomId,
+        });
+        respond(
+          true,
+          {
+            sessionId: handoff.id,
+            provider: handoff.provider,
+            mode: handoff.mode,
+            transport: handoff.transport,
+            brain: handoff.brain,
+            handoffId: handoff.id,
+            roomId: handoff.roomId,
+            roomUrl: handoff.roomUrl,
+            token: handoff.token,
+            model: handoff.model,
+            voice: handoff.voice,
+            expiresAt: handoff.expiresAt,
+          },
+          undefined,
+        );
+        return;
+      }
+
+      const connId = client?.connId;
+      if (!connId) {
+        respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Talk session unavailable"));
+        return;
+      }
+
+      if (mode === "realtime") {
+        if (transport !== "gateway-relay" || brain !== "agent-consult") {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `realtime talk.session.create requires transport="gateway-relay" and brain="agent-consult"`,
+            ),
+          );
+          return;
+        }
+        const runtimeConfig = context.getRuntimeConfig();
+        const realtimeConfig = buildTalkRealtimeConfig(runtimeConfig, params.provider);
+        const resolution = resolveConfiguredRealtimeVoiceProvider({
+          configuredProviderId: realtimeConfig.provider,
+          providerConfigs: realtimeConfig.providers,
+          cfg: runtimeConfig,
+          cfgForResolve: runtimeConfig,
+          noRegisteredProviderMessage: "No realtime voice provider registered",
+        });
+        const model = normalizeOptionalString(params.model) ?? realtimeConfig.model;
+        const voice = normalizeOptionalString(params.voice) ?? realtimeConfig.voice;
+        const session = createTalkRealtimeRelaySession({
+          context,
+          connId,
+          provider: resolution.provider,
+          providerConfig: withRealtimeBrowserOverrides(resolution.providerConfig, { model, voice }),
+          instructions: buildRealtimeInstructions(),
+          tools: [REALTIME_VOICE_AGENT_CONSULT_TOOL],
+          model,
+          voice,
+        });
+        unifiedTalkSessions.set(session.relaySessionId, {
+          kind: "realtime-relay",
+          connId,
+          relaySessionId: session.relaySessionId,
+        });
+        respond(
+          true,
+          {
+            ...session,
+            sessionId: session.relaySessionId,
+            mode,
+            brain,
+          },
+          undefined,
+        );
+        return;
+      }
+
+      if (mode === "transcription") {
+        if (transport !== "gateway-relay" || brain !== "none") {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `transcription talk.session.create requires transport="gateway-relay" and brain="none"`,
+            ),
+          );
+          return;
+        }
+        const runtimeConfig = context.getRuntimeConfig();
+        const transcriptionConfig = buildTalkTranscriptionConfig(runtimeConfig, params.provider);
+        const resolution = resolveConfiguredRealtimeTranscriptionProvider({
+          config: runtimeConfig,
+          configuredProviderId: transcriptionConfig.provider,
+          providerConfigs: transcriptionConfig.providers,
+        });
+        const session = createTalkTranscriptionRelaySession({
+          context,
+          connId,
+          provider: resolution.provider,
+          providerConfig: resolution.providerConfig,
+        });
+        unifiedTalkSessions.set(session.transcriptionSessionId, {
+          kind: "transcription-relay",
+          connId,
+          transcriptionSessionId: session.transcriptionSessionId,
+        });
+        respond(
+          true,
+          {
+            ...session,
+            sessionId: session.transcriptionSessionId,
+            brain,
+          },
+          undefined,
+        );
+        return;
+      }
+
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `stt-tts talk.session.create requires transport="managed-room"`,
+        ),
+      );
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.session.inputAudio": async ({ params, respond, client }) => {
+    if (!validateTalkSessionInputAudioParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.session.inputAudio params: ${formatValidationErrors(validateTalkSessionInputAudioParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    try {
+      const session = getUnifiedTalkSession(params.sessionId);
+      if (session.kind === "realtime-relay") {
+        const connId = requireTalkSessionConn(session, client?.connId);
+        sendTalkRealtimeRelayAudio({
+          relaySessionId: session.relaySessionId,
+          connId,
+          audioBase64: params.audioBase64,
+          timestamp: params.timestamp,
+        });
+        respond(true, { ok: true }, undefined);
+        return;
+      }
+      if (session.kind === "transcription-relay") {
+        const connId = requireTalkSessionConn(session, client?.connId);
+        sendTalkTranscriptionRelayAudio({
+          transcriptionSessionId: session.transcriptionSessionId,
+          connId,
+          audioBase64: params.audioBase64,
+        });
+        respond(true, { ok: true }, undefined);
+        return;
+      }
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "talk.session.inputAudio is not supported for managed-room sessions",
+        ),
+      );
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.session.control": async ({ params, respond, client, context }) => {
+    if (!validateTalkSessionControlParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.session.control params: ${formatValidationErrors(validateTalkSessionControlParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    try {
+      const session = getUnifiedTalkSession(params.sessionId);
+      if (session.kind === "realtime-relay") {
+        if (params.type !== "turn.cancel") {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `realtime relay sessions only support talk.session.control type="turn.cancel"`,
+            ),
+          );
+          return;
+        }
+        const connId = requireTalkSessionConn(session, client?.connId);
+        cancelTalkRealtimeRelayTurn({
+          relaySessionId: session.relaySessionId,
+          connId,
+          reason: normalizeOptionalString(params.reason),
+        });
+        respond(true, { ok: true }, undefined);
+        return;
+      }
+      if (session.kind === "transcription-relay") {
+        if (params.type !== "turn.cancel") {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `transcription relay sessions only support talk.session.control type="turn.cancel"`,
+            ),
+          );
+          return;
+        }
+        const connId = requireTalkSessionConn(session, client?.connId);
+        cancelTalkTranscriptionRelayTurn({
+          transcriptionSessionId: session.transcriptionSessionId,
+          connId,
+          reason: normalizeOptionalString(params.reason),
+        });
+        respond(true, { ok: true }, undefined);
+        return;
+      }
+
+      const result =
+        params.type === "turn.start"
+          ? startTalkHandoffTurn(session.handoffId, session.token, {
+              turnId: params.turnId,
+              clientId: client?.connId,
+            })
+          : params.type === "turn.end"
+            ? endTalkHandoffTurn(session.handoffId, session.token, { turnId: params.turnId })
+            : cancelTalkHandoffTurn(session.handoffId, session.token, {
+                turnId: params.turnId,
+                reason: params.reason,
+              });
+      if (!result.ok) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            talkHandoffErrorCode(result.reason),
+            `talk session control failed: ${result.reason}`,
+          ),
+        );
+        return;
+      }
+      broadcastTalkRoomEvents(context, result.record.room.activeClientId, {
+        handoffId: result.record.id,
+        roomId: result.record.roomId,
+        events: result.events,
+      });
+      respond(true, { ok: true, turnId: result.turnId, events: result.events }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.session.toolResult": async ({ params, respond, client }) => {
+    if (!validateTalkSessionToolResultParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.session.toolResult params: ${formatValidationErrors(validateTalkSessionToolResultParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    try {
+      const session = getUnifiedTalkSession(params.sessionId);
+      if (session.kind !== "realtime-relay") {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "talk.session.toolResult is only supported for realtime relay sessions",
+          ),
+        );
+        return;
+      }
+      const connId = requireTalkSessionConn(session, client?.connId);
+      submitTalkRealtimeRelayToolResult({
+        relaySessionId: session.relaySessionId,
+        connId,
+        callId: params.callId,
+        result: params.result,
+      });
+      respond(true, { ok: true }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.session.close": async ({ params, respond, client }) => {
+    if (!validateTalkSessionCloseParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.session.close params: ${formatValidationErrors(validateTalkSessionCloseParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    try {
+      const session = getUnifiedTalkSession(params.sessionId);
+      if (session.kind === "realtime-relay") {
+        const connId = requireTalkSessionConn(session, client?.connId);
+        stopTalkRealtimeRelaySession({ relaySessionId: session.relaySessionId, connId });
+      } else if (session.kind === "transcription-relay") {
+        const connId = requireTalkSessionConn(session, client?.connId);
+        stopTalkTranscriptionRelaySession({
+          transcriptionSessionId: session.transcriptionSessionId,
+          connId,
+        });
+      } else {
+        revokeTalkHandoff(session.handoffId);
+      }
+      unifiedTalkSessions.delete(params.sessionId);
+      respond(true, { ok: true }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.catalog": async ({ params, respond, context }) => {
+    const catalogParams = params ?? {};
+    if (!validateTalkCatalogParams(catalogParams)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.catalog params: ${formatValidationErrors(validateTalkCatalogParams.errors)}`,
+        ),
+      );
+      return;
+    }
+
+    try {
+      respond(true, buildTalkCatalog(context.getRuntimeConfig()), undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
   "talk.config": async ({ params, respond, client, context }) => {
     if (!validateTalkConfigParams(params)) {
       respond(
@@ -492,6 +1361,195 @@ export const talkHandlers: GatewayRequestHandlers = {
 
     respond(true, { config: configPayload }, undefined);
   },
+  "talk.handoff.create": async ({ params, respond, client, context }) => {
+    if (!validateTalkHandoffCreateParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.handoff.create params: ${formatValidationErrors(validateTalkHandoffCreateParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    if (params.brain === "direct-tools" && !canUseTalkDirectTools(client)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `talk.handoff.create brain="direct-tools" requires gateway scope: ${ADMIN_SCOPE}`,
+        ),
+      );
+      return;
+    }
+    const resolvedSession = await resolveSessionKeyFromResolveParams({
+      cfg: context.getRuntimeConfig(),
+      p: {
+        key: params.sessionKey,
+        includeGlobal: true,
+        includeUnknown: true,
+      },
+    });
+    if (!resolvedSession.ok) {
+      respond(false, undefined, resolvedSession.error);
+      return;
+    }
+    respond(true, createTalkHandoff({ ...params, sessionKey: resolvedSession.key }), undefined);
+  },
+  "talk.handoff.join": async ({ params, respond, client, context }) => {
+    if (!validateTalkHandoffJoinParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.handoff.join params: ${formatValidationErrors(validateTalkHandoffJoinParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const result = joinTalkHandoff(params.id, params.token, { clientId: client?.connId });
+    if (!result.ok) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          result.reason === "invalid_token" ? ErrorCodes.INVALID_REQUEST : ErrorCodes.UNAVAILABLE,
+          `talk handoff join failed: ${result.reason}`,
+        ),
+      );
+      return;
+    }
+    broadcastTalkRoomEvents(context, client?.connId, {
+      handoffId: result.record.id,
+      roomId: result.record.roomId,
+      events: result.events,
+    });
+    respond(true, result.record, undefined);
+  },
+  "talk.handoff.revoke": async ({ params, respond, context }) => {
+    if (!validateTalkHandoffRevokeParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.handoff.revoke params: ${formatValidationErrors(validateTalkHandoffRevokeParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const result = revokeTalkHandoff(params.id);
+    broadcastTalkRoomEvents(context, result.activeClientId, {
+      handoffId: params.id,
+      roomId: result.roomId ?? "",
+      events: result.events,
+    });
+    respond(true, { ok: true, revoked: result.revoked }, undefined);
+  },
+  "talk.handoff.turnStart": async ({ params, respond, client, context }) => {
+    if (!validateTalkHandoffTurnStartParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.handoff.turnStart params: ${formatValidationErrors(validateTalkHandoffTurnStartParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const result = startTalkHandoffTurn(params.id, params.token, {
+      turnId: params.turnId,
+      clientId: client?.connId,
+    });
+    if (!result.ok) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          talkHandoffErrorCode(result.reason),
+          `talk handoff turn start failed: ${result.reason}`,
+        ),
+      );
+      return;
+    }
+    broadcastTalkRoomEvents(context, result.record.room.activeClientId, {
+      handoffId: result.record.id,
+      roomId: result.record.roomId,
+      events: result.events,
+    });
+    respond(true, result, undefined);
+  },
+  "talk.handoff.turnEnd": async ({ params, respond, context }) => {
+    if (!validateTalkHandoffTurnEndParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.handoff.turnEnd params: ${formatValidationErrors(validateTalkHandoffTurnEndParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const result = endTalkHandoffTurn(params.id, params.token, {
+      turnId: params.turnId,
+    });
+    if (!result.ok) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          talkHandoffErrorCode(result.reason),
+          `talk handoff turn end failed: ${result.reason}`,
+        ),
+      );
+      return;
+    }
+    broadcastTalkRoomEvents(context, result.record.room.activeClientId, {
+      handoffId: result.record.id,
+      roomId: result.record.roomId,
+      events: result.events,
+    });
+    respond(true, result, undefined);
+  },
+  "talk.handoff.turnCancel": async ({ params, respond, context }) => {
+    if (!validateTalkHandoffTurnCancelParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.handoff.turnCancel params: ${formatValidationErrors(validateTalkHandoffTurnCancelParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const result = cancelTalkHandoffTurn(params.id, params.token, {
+      turnId: params.turnId,
+      reason: params.reason,
+    });
+    if (!result.ok) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          talkHandoffErrorCode(result.reason),
+          `talk handoff turn cancel failed: ${result.reason}`,
+        ),
+      );
+      return;
+    }
+    broadcastTalkRoomEvents(context, result.record.room.activeClientId, {
+      handoffId: result.record.id,
+      roomId: result.record.roomId,
+      events: result.events,
+    });
+    respond(true, result, undefined);
+  },
   "talk.realtime.session": async ({ params, respond, context, client }) => {
     if (!validateTalkRealtimeSessionParams(params)) {
       respond(
@@ -508,10 +1566,54 @@ export const talkHandlers: GatewayRequestHandlers = {
       provider?: string;
       model?: string;
       voice?: string;
+      mode?: string;
+      transport?: string;
+      brain?: string;
     };
     try {
       const runtimeConfig = context.getRuntimeConfig();
       const realtimeConfig = buildTalkRealtimeConfig(runtimeConfig, typedParams.provider);
+      const mode =
+        normalizeOptionalLowercaseString(typedParams.mode) ?? realtimeConfig.mode ?? "realtime";
+      if (mode !== "realtime") {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `talk.realtime.session only supports mode="realtime"; use talk.catalog for ${mode} provider discovery`,
+          ),
+        );
+        return;
+      }
+      const brain =
+        normalizeOptionalLowercaseString(typedParams.brain) ??
+        realtimeConfig.brain ??
+        "agent-consult";
+      if (brain !== "agent-consult") {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `talk.realtime.session only supports brain="agent-consult"`,
+          ),
+        );
+        return;
+      }
+      const transport =
+        normalizeOptionalLowercaseString(typedParams.transport) ?? realtimeConfig.transport;
+      if (transport === "managed-room") {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "managed-room realtime Talk sessions are not available in the browser UI yet",
+          ),
+        );
+        return;
+      }
       const resolution = resolveConfiguredRealtimeVoiceProvider({
         configuredProviderId: realtimeConfig.provider,
         providerConfigs: realtimeConfig.providers,
@@ -519,16 +1621,30 @@ export const talkHandlers: GatewayRequestHandlers = {
         cfgForResolve: runtimeConfig,
         noRegisteredProviderMessage: "No realtime voice provider registered",
       });
-      if (resolution.provider.createBrowserSession) {
+      if (resolution.provider.createBrowserSession && transport !== "gateway-relay") {
         const session = await resolution.provider.createBrowserSession({
           providerConfig: resolution.providerConfig,
           instructions: buildRealtimeInstructions(),
           tools: [REALTIME_VOICE_AGENT_CONSULT_TOOL],
-          model: normalizeOptionalString(typedParams.model),
-          voice: normalizeOptionalString(typedParams.voice),
+          model: normalizeOptionalString(typedParams.model) ?? realtimeConfig.model,
+          voice: normalizeOptionalString(typedParams.voice) ?? realtimeConfig.voice,
         });
-        if (!isUnsupportedBrowserWebRtcSession(session)) {
+        if (
+          !isUnsupportedBrowserWebRtcSession(session) &&
+          (!transport || session.transport === transport)
+        ) {
           respond(true, session, undefined);
+          return;
+        }
+        if (transport) {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.UNAVAILABLE,
+              `Realtime provider "${resolution.provider.id}" does not support requested browser transport "${transport}"`,
+            ),
+          );
           return;
         }
       }
@@ -542,8 +1658,8 @@ export const talkHandlers: GatewayRequestHandlers = {
         );
         return;
       }
-      const model = normalizeOptionalString(typedParams.model);
-      const voice = normalizeOptionalString(typedParams.voice);
+      const model = normalizeOptionalString(typedParams.model) ?? realtimeConfig.model;
+      const voice = normalizeOptionalString(typedParams.voice) ?? realtimeConfig.voice;
       const session = createTalkRealtimeRelaySession({
         context,
         connId,
@@ -558,6 +1674,49 @@ export const talkHandlers: GatewayRequestHandlers = {
     } catch (err) {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
     }
+  },
+  "talk.realtime.toolCall": async (request) => {
+    const { params, respond } = request;
+    if (!validateTalkRealtimeToolCallParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.realtime.toolCall params: ${formatValidationErrors(validateTalkRealtimeToolCallParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    if (params.name !== REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, `unsupported realtime Talk tool: ${params.name}`),
+      );
+      return;
+    }
+
+    const result = await startRealtimeToolCallAgentConsult({
+      sessionKey: params.sessionKey,
+      callId: params.callId,
+      args: params.args ?? {},
+      relaySessionId: normalizeOptionalString(params.relaySessionId),
+      connId: normalizeOptionalString(request.client?.connId),
+      request,
+    });
+    if (!result.ok) {
+      respond(false, undefined, result.error);
+      return;
+    }
+    respond(
+      true,
+      {
+        runId: result.runId,
+        idempotencyKey: result.idempotencyKey,
+      },
+      undefined,
+    );
   },
   "talk.realtime.relayAudio": async ({ params, respond, client }) => {
     if (!validateTalkRealtimeRelayAudioParams(params)) {
@@ -612,6 +1771,34 @@ export const talkHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
     }
   },
+  "talk.realtime.relayCancel": async ({ params, respond, client }) => {
+    if (!validateTalkRealtimeRelayCancelParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.realtime.relayCancel params: ${formatValidationErrors(validateTalkRealtimeRelayCancelParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const connId = client?.connId;
+    if (!connId) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "realtime relay unavailable"));
+      return;
+    }
+    try {
+      cancelTalkRealtimeRelayTurn({
+        relaySessionId: params.relaySessionId,
+        connId,
+        reason: normalizeOptionalString(params.reason),
+      });
+      respond(true, { ok: true }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
   "talk.realtime.relayStop": async ({ params, respond, client }) => {
     if (!validateTalkRealtimeRelayStopParams(params)) {
       respond(
@@ -659,6 +1846,141 @@ export const talkHandlers: GatewayRequestHandlers = {
         connId,
         callId: params.callId,
         result: params.result,
+      });
+      respond(true, { ok: true }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.transcription.session": async ({ params, respond, context, client }) => {
+    if (!validateTalkTranscriptionSessionParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.transcription.session params: ${formatValidationErrors(validateTalkTranscriptionSessionParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const connId = client?.connId;
+    if (!connId) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "transcription relay requires a connected client"),
+      );
+      return;
+    }
+    try {
+      const runtimeConfig = context.getRuntimeConfig();
+      const transcriptionConfig = buildTalkTranscriptionConfig(runtimeConfig, params.provider);
+      const resolution = resolveConfiguredRealtimeTranscriptionProvider({
+        config: runtimeConfig,
+        configuredProviderId: transcriptionConfig.provider,
+        providerConfigs: transcriptionConfig.providers,
+      });
+      const session = createTalkTranscriptionRelaySession({
+        context,
+        connId,
+        provider: resolution.provider,
+        providerConfig: resolution.providerConfig,
+      });
+      respond(true, session, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.transcription.relayAudio": async ({ params, respond, client }) => {
+    if (!validateTalkTranscriptionRelayAudioParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.transcription.relayAudio params: ${formatValidationErrors(validateTalkTranscriptionRelayAudioParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const connId = client?.connId;
+    if (!connId) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "transcription relay unavailable"),
+      );
+      return;
+    }
+    try {
+      sendTalkTranscriptionRelayAudio({
+        transcriptionSessionId: params.transcriptionSessionId,
+        connId,
+        audioBase64: params.audioBase64,
+      });
+      respond(true, { ok: true }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.transcription.relayCancel": async ({ params, respond, client }) => {
+    if (!validateTalkTranscriptionRelayCancelParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.transcription.relayCancel params: ${formatValidationErrors(validateTalkTranscriptionRelayCancelParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const connId = client?.connId;
+    if (!connId) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "transcription relay unavailable"),
+      );
+      return;
+    }
+    try {
+      cancelTalkTranscriptionRelayTurn({
+        transcriptionSessionId: params.transcriptionSessionId,
+        connId,
+        reason: normalizeOptionalString(params.reason),
+      });
+      respond(true, { ok: true }, undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.transcription.relayStop": async ({ params, respond, client }) => {
+    if (!validateTalkTranscriptionRelayStopParams(params)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.transcription.relayStop params: ${formatValidationErrors(validateTalkTranscriptionRelayStopParams.errors)}`,
+        ),
+      );
+      return;
+    }
+    const connId = client?.connId;
+    if (!connId) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "transcription relay unavailable"),
+      );
+      return;
+    }
+    try {
+      stopTalkTranscriptionRelaySession({
+        transcriptionSessionId: params.transcriptionSessionId,
+        connId,
       });
       respond(true, { ok: true }, undefined);
     } catch (err) {
@@ -763,11 +2085,11 @@ export const talkHandlers: GatewayRequestHandlers = {
     }
   },
   "talk.mode": ({ params, respond, context, client, isWebchatConnect }) => {
-    if (client && isWebchatConnect(client.connect) && !context.hasConnectedMobileNode()) {
+    if (client && isWebchatConnect(client.connect) && !context.hasConnectedTalkNode()) {
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.UNAVAILABLE, "talk disabled: no connected iOS/Android nodes"),
+        errorShape(ErrorCodes.UNAVAILABLE, "talk disabled: no connected Talk-capable nodes"),
       );
       return;
     }

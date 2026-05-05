@@ -22251,6 +22251,136 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
             description:
               "Provider-specific Talk settings keyed by provider id. During migration, prefer this over legacy talk.* keys.",
           },
+          realtime: {
+            type: "object",
+            properties: {
+              provider: {
+                type: "string",
+                title: "Talk Realtime Provider",
+                description: "Active realtime voice provider id, such as openai or google.",
+              },
+              providers: {
+                type: "object",
+                propertyNames: {
+                  type: "string",
+                },
+                additionalProperties: {
+                  type: "object",
+                  properties: {
+                    apiKey: {
+                      anyOf: [
+                        {
+                          type: "string",
+                        },
+                        {
+                          oneOf: [
+                            {
+                              type: "object",
+                              properties: {
+                                source: {
+                                  type: "string",
+                                  const: "env",
+                                },
+                                provider: {
+                                  type: "string",
+                                  pattern: "^[a-z][a-z0-9_-]{0,63}$",
+                                },
+                                id: {
+                                  type: "string",
+                                  pattern: "^[A-Z][A-Z0-9_]{0,127}$",
+                                },
+                              },
+                              required: ["source", "provider", "id"],
+                              additionalProperties: false,
+                            },
+                            {
+                              type: "object",
+                              properties: {
+                                source: {
+                                  type: "string",
+                                  const: "file",
+                                },
+                                provider: {
+                                  type: "string",
+                                  pattern: "^[a-z][a-z0-9_-]{0,63}$",
+                                },
+                                id: {
+                                  type: "string",
+                                },
+                              },
+                              required: ["source", "provider", "id"],
+                              additionalProperties: false,
+                            },
+                            {
+                              type: "object",
+                              properties: {
+                                source: {
+                                  type: "string",
+                                  const: "exec",
+                                },
+                                provider: {
+                                  type: "string",
+                                  pattern: "^[a-z][a-z0-9_-]{0,63}$",
+                                },
+                                id: {
+                                  type: "string",
+                                },
+                              },
+                              required: ["source", "provider", "id"],
+                              additionalProperties: false,
+                            },
+                          ],
+                        },
+                      ],
+                      title: "Talk Realtime Provider API Key",
+                      description: "Provider API key for realtime Talk.",
+                    },
+                  },
+                  additionalProperties: {},
+                  title: "Talk Realtime Provider Config",
+                  description: "Provider-owned realtime voice config for the matching provider id.",
+                },
+                title: "Talk Realtime Provider Settings",
+                description: "Provider-specific realtime voice settings keyed by provider id.",
+              },
+              model: {
+                type: "string",
+                title: "Talk Realtime Model",
+                description:
+                  "Realtime provider model id override for browser or Gateway-owned Talk sessions.",
+              },
+              voice: {
+                type: "string",
+                title: "Talk Realtime Voice",
+                description:
+                  "Realtime provider voice id override for browser or Gateway-owned Talk sessions.",
+              },
+              mode: {
+                type: "string",
+                enum: ["realtime", "stt-tts", "transcription"],
+                title: "Talk Realtime Mode",
+                description: "Talk execution mode: realtime, stt-tts, or transcription.",
+              },
+              transport: {
+                type: "string",
+                enum: ["webrtc", "provider-websocket", "gateway-relay", "managed-room"],
+                title: "Talk Realtime Transport",
+                description:
+                  "Talk byte/session transport: webrtc, provider-websocket, gateway-relay, or managed-room.",
+              },
+              brain: {
+                type: "string",
+                enum: ["agent-consult", "direct-tools", "none"],
+                title: "Talk Realtime Brain",
+                description:
+                  "Talk reasoning strategy: agent-consult for Gateway-mediated agent help, direct-tools for owner-only tool calls, or none.",
+              },
+            },
+            additionalProperties: false,
+            title: "Talk Realtime",
+            description:
+              "Realtime Talk provider, model, voice, mode, transport, and brain strategy. Keep speech/TTS provider config in talk.provider and talk.providers.",
+          },
           speechLocale: {
             type: "string",
             title: "Talk Speech Locale",
@@ -28813,6 +28943,57 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
       help: "Provider API key for Talk mode.",
       tags: ["security", "auth", "media"],
       sensitive: true,
+    },
+    "talk.realtime": {
+      label: "Talk Realtime",
+      help: "Realtime Talk provider, model, voice, mode, transport, and brain strategy. Keep speech/TTS provider config in talk.provider and talk.providers.",
+      tags: ["media"],
+    },
+    "talk.realtime.provider": {
+      label: "Talk Realtime Provider",
+      help: "Active realtime voice provider id, such as openai or google.",
+      tags: ["media"],
+    },
+    "talk.realtime.providers": {
+      label: "Talk Realtime Provider Settings",
+      help: "Provider-specific realtime voice settings keyed by provider id.",
+      tags: ["media"],
+    },
+    "talk.realtime.providers.*": {
+      label: "Talk Realtime Provider Config",
+      help: "Provider-owned realtime voice config for the matching provider id.",
+      tags: ["media"],
+    },
+    "talk.realtime.providers.*.apiKey": {
+      label: "Talk Realtime Provider API Key",
+      help: "Provider API key for realtime Talk.",
+      tags: ["security", "auth", "media"],
+      sensitive: true,
+    },
+    "talk.realtime.model": {
+      label: "Talk Realtime Model",
+      help: "Realtime provider model id override for browser or Gateway-owned Talk sessions.",
+      tags: ["models", "media"],
+    },
+    "talk.realtime.voice": {
+      label: "Talk Realtime Voice",
+      help: "Realtime provider voice id override for browser or Gateway-owned Talk sessions.",
+      tags: ["media"],
+    },
+    "talk.realtime.mode": {
+      label: "Talk Realtime Mode",
+      help: "Talk execution mode: realtime, stt-tts, or transcription.",
+      tags: ["media"],
+    },
+    "talk.realtime.transport": {
+      label: "Talk Realtime Transport",
+      help: "Talk byte/session transport: webrtc, provider-websocket, gateway-relay, or managed-room.",
+      tags: ["media"],
+    },
+    "talk.realtime.brain": {
+      label: "Talk Realtime Brain",
+      help: "Talk reasoning strategy: agent-consult for Gateway-mediated agent help, direct-tools for owner-only tool calls, or none.",
+      tags: ["media"],
     },
     "channels.defaults": {
       label: "Channel Defaults",

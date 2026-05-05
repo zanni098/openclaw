@@ -28,6 +28,10 @@
     "target": "OpenClaw 应用 SDK API 设计"
   },
   {
+    "source": "Talk mode",
+    "target": "Talk 模式"
+  },
+  {
     "source": "Azure Speech",
     "target": "Azure Speech"
   },

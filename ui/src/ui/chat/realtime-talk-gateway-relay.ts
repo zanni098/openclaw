@@ -3,31 +3,38 @@ import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
   submitRealtimeTalkConsult,
   type RealtimeTalkGatewayRelaySessionResult,
+  type RealtimeTalkEvent,
   type RealtimeTalkTransport,
   type RealtimeTalkTransportContext,
 } from "./realtime-talk-shared.ts";
 
-type GatewayRelayEvent =
-  | { relaySessionId?: string; type?: "ready" }
-  | { relaySessionId?: string; type?: "audio"; audioBase64?: string }
-  | { relaySessionId?: string; type?: "clear" }
-  | { relaySessionId?: string; type?: "mark"; markName?: string }
+type GatewayRelayEvent = {
+  relaySessionId?: string;
+  talkEvent?: RealtimeTalkEvent;
+} & (
+  | { type?: "ready" }
+  | { type?: "audio"; audioBase64?: string }
+  | { type?: "clear" }
+  | { type?: "mark"; markName?: string }
   | {
-      relaySessionId?: string;
       type?: "transcript";
       role?: "user" | "assistant";
       text?: string;
       final?: boolean;
     }
   | {
-      relaySessionId?: string;
       type?: "toolCall";
       callId?: string;
       name?: string;
       args?: unknown;
     }
-  | { relaySessionId?: string; type?: "error"; message?: string }
-  | { relaySessionId?: string; type?: "close"; reason?: string };
+  | { type?: "error"; message?: string }
+  | { type?: "close"; reason?: string }
+);
+
+const BARGE_IN_RMS_THRESHOLD = 0.02;
+const BARGE_IN_PEAK_THRESHOLD = 0.08;
+const BARGE_IN_CONSECUTIVE_SPEECH_FRAMES = 2;
 
 export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport {
   private media: MediaStream | null = null;
@@ -39,6 +46,8 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
   private playhead = 0;
   private closed = false;
   private readonly sources = new Set<AudioBufferSourceNode>();
+  private cancelRequestedForPlayback = false;
+  private speechFramesDuringPlayback = 0;
 
   constructor(
     private readonly session: RealtimeTalkGatewayRelaySessionResult,
@@ -62,7 +71,13 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
       }
       this.handleRelayEvent(evt.payload as GatewayRelayEvent);
     });
-    this.media = await navigator.mediaDevices.getUserMedia({ audio: true });
+    this.media = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        autoGainControl: true,
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
+    });
     this.inputContext = new AudioContext({ sampleRate: this.session.audio.inputSampleRateHz });
     this.outputContext = new AudioContext({ sampleRate: this.session.audio.outputSampleRateHz });
     this.startMicrophonePump();
@@ -98,7 +113,11 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
       if (this.closed) {
         return;
       }
-      const pcm = floatToPcm16(event.inputBuffer.getChannelData(0));
+      const samples = event.inputBuffer.getChannelData(0);
+      const pcm = floatToPcm16(samples);
+      if (this.detectBargeInSpeech(samples)) {
+        this.cancelOutputForBargeIn();
+      }
       void this.ctx.client.request("talk.realtime.relayAudio", {
         relaySessionId: this.session.relaySessionId,
         audioBase64: bytesToBase64(pcm),
@@ -113,12 +132,17 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
     if (event.relaySessionId !== this.session.relaySessionId || this.closed) {
       return;
     }
+    if (event.talkEvent) {
+      this.ctx.callbacks.onTalkEvent?.(event.talkEvent);
+    }
     switch (event.type) {
       case "ready":
         this.ctx.callbacks.onStatus?.("listening");
         return;
       case "audio":
         if (event.audioBase64) {
+          this.cancelRequestedForPlayback = false;
+          this.speechFramesDuringPlayback = 0;
           this.playPcm16(event.audioBase64);
         }
         return;
@@ -188,6 +212,7 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
     }
     this.sources.clear();
     this.playhead = this.outputContext?.currentTime ?? 0;
+    this.speechFramesDuringPlayback = 0;
   }
 
   private scheduleMarkAck(): void {
@@ -223,6 +248,7 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
       ctx: this.ctx,
       callId,
       args: event.args ?? {},
+      relaySessionId: this.session.relaySessionId,
       submit: (toolCallId, result) => this.submitToolResult(toolCallId, result),
     });
   }
@@ -233,5 +259,39 @@ export class GatewayRelayRealtimeTalkTransport implements RealtimeTalkTransport 
       callId,
       result,
     });
+  }
+
+  private cancelOutputForBargeIn(): void {
+    if (this.sources.size === 0 || this.cancelRequestedForPlayback) {
+      return;
+    }
+    this.cancelRequestedForPlayback = true;
+    this.stopOutput();
+    void this.ctx.client.request("talk.realtime.relayCancel", {
+      relaySessionId: this.session.relaySessionId,
+      reason: "barge-in",
+    });
+  }
+
+  private detectBargeInSpeech(samples: Float32Array): boolean {
+    if (this.sources.size === 0 || this.cancelRequestedForPlayback || samples.length === 0) {
+      this.speechFramesDuringPlayback = 0;
+      return false;
+    }
+
+    let sumSquares = 0;
+    let peak = 0;
+    for (const sample of samples) {
+      const abs = Math.abs(sample);
+      peak = Math.max(peak, abs);
+      sumSquares += sample * sample;
+    }
+    const rms = Math.sqrt(sumSquares / samples.length);
+    if (rms >= BARGE_IN_RMS_THRESHOLD && peak >= BARGE_IN_PEAK_THRESHOLD) {
+      this.speechFramesDuringPlayback += 1;
+    } else {
+      this.speechFramesDuringPlayback = 0;
+    }
+    return this.speechFramesDuringPlayback >= BARGE_IN_CONSECUTIVE_SPEECH_FRAMES;
   }
 }
